@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "A very fast Tree that support get/set/del operations"
 license = "MPL-2.0"
+repository = "https://github.com/JoshuaBOUCHAT/oxidart"
+homepage = "https://github.com/JoshuaBOUCHAT/oxidart"
+documentation = "https://docs.rs/oxidart"
+readme = "README.md"
+keywords = ["radix-tree", "art", "trie", "data-structure", "key-value"]
+categories = ["data-structures", "algorithms"]
 
 [dependencies]
 arrayvec = "0.7.6"
