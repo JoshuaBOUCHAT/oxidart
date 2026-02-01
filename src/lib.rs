@@ -1,7 +1,6 @@
 mod node_childs;
 #[cfg(test)]
 mod test;
-use std::u32;
 
 use bytes::Bytes;
 use slab::Slab;
@@ -17,6 +16,12 @@ pub struct OxidArt {
     versions: Vec<u32>,
     root_idx: u32,
 }
+impl Default for OxidArt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OxidArt {
     pub fn new() -> Self {
         let mut map = Slab::with_capacity(1024);
@@ -60,7 +65,7 @@ impl OxidArt {
         let child = &self.try_get_node(idx)?.childs;
 
         if let Some(index) = child.find(radix) {
-            return Some(index as u32);
+            return Some(index);
         }
         self.child_list
             .get(child.get_next_idx()? as usize)?
@@ -72,6 +77,7 @@ impl OxidArt {
 }
 impl OxidArt {
     pub fn get(&self, key: Bytes) -> Option<Bytes> {
+        debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
             return self.try_get_node(self.root_idx)?.val.clone();
@@ -86,9 +92,9 @@ impl OxidArt {
             //on passe dans le node donc le cursor augmente de 1
             cursor += 1;
             match node.compare_compression_key(&key[cursor..]) {
-                CompResult::CompIsFinal => return node.val.clone(),
-                CompResult::CompIsPartial(_) => return None,
-                CompResult::CompIsPath => {
+                CompResult::Final => return node.val.clone(),
+                CompResult::Partial(_) => return None,
+                CompResult::Path => {
                     cursor += node.compression.len();
                 }
             }
@@ -97,6 +103,7 @@ impl OxidArt {
 
     /// Retourne tous les (clé, valeur) dont la clé commence par `prefix`
     pub fn getn(&self, prefix: Bytes) -> Vec<(Bytes, Bytes)> {
+        debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
         let mut results = Vec::new();
         let prefix_len = prefix.len();
 
@@ -124,13 +131,13 @@ impl OxidArt {
             cursor += 1;
 
             match node.compare_compression_key(&prefix[cursor..]) {
-                CompResult::CompIsFinal => {
+                CompResult::Final => {
                     // Préfixe exact trouvé
                     key_path.extend_from_slice(&node.compression);
                     self.collect_all_from(idx, key_path, &mut results);
                     return results;
                 }
-                CompResult::CompIsPartial(common_len) => {
+                CompResult::Partial(common_len) => {
                     let prefix_rest_len = prefix_len - cursor;
                     if common_len == prefix_rest_len {
                         // Préfixe se termine dans la compression
@@ -139,7 +146,7 @@ impl OxidArt {
                     }
                     return results;
                 }
-                CompResult::CompIsPath => {
+                CompResult::Path => {
                     key_path.extend_from_slice(&node.compression);
                     cursor += node.compression.len();
                 }
@@ -148,7 +155,12 @@ impl OxidArt {
     }
 
     /// Collecte depuis un node dont la clé est déjà complète dans key_path
-    fn collect_all_from(&self, node_idx: u32, key_path: Vec<u8>, results: &mut Vec<(Bytes, Bytes)>) {
+    fn collect_all_from(
+        &self,
+        node_idx: u32,
+        key_path: Vec<u8>,
+        results: &mut Vec<(Bytes, Bytes)>,
+    ) {
         let Some(node) = self.try_get_node(node_idx) else {
             return;
         };
@@ -165,7 +177,12 @@ impl OxidArt {
     }
 
     /// Collecte récursivement, ajoute la compression du node
-    fn collect_all(&self, node_idx: u32, mut key_prefix: Vec<u8>, results: &mut Vec<(Bytes, Bytes)>) {
+    fn collect_all(
+        &self,
+        node_idx: u32,
+        mut key_prefix: Vec<u8>,
+        results: &mut Vec<(Bytes, Bytes)>,
+    ) {
         let Some(node) = self.try_get_node(node_idx) else {
             return;
         };
@@ -196,15 +213,16 @@ impl OxidArt {
             f(radix, child_idx);
         }
 
-        if let Some(huge_idx) = node.childs.get_next_idx() {
-            if let Some(huge_childs) = self.child_list.get(huge_idx as usize) {
-                for (radix, child_idx) in huge_childs.iter() {
-                    f(radix, child_idx);
-                }
+        if let Some(huge_idx) = node.childs.get_next_idx()
+            && let Some(huge_childs) = self.child_list.get(huge_idx as usize)
+        {
+            for (radix, child_idx) in huge_childs.iter() {
+                f(radix, child_idx);
             }
         }
     }
     pub fn set(&mut self, key: Bytes, val: Bytes) {
+        debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
             self.get_node_mut(self.root_idx).set_val(val);
@@ -223,15 +241,15 @@ impl OxidArt {
             cursor += 1;
             let node_comparaison = self.get_node(idx).compare_compression_key(&key[cursor..]);
             let common_len = match node_comparaison {
-                CompResult::CompIsFinal => {
+                CompResult::Final => {
                     self.get_node_mut(idx).set_val(val);
                     return;
                 }
-                CompResult::CompIsPath => {
+                CompResult::Path => {
                     cursor += self.get_node(idx).compression.len();
                     continue;
                 }
-                CompResult::CompIsPartial(common_len) => common_len,
+                CompResult::Partial(common_len) => common_len,
             };
 
             // Split: la compression du node ne match que partiellement la clé
@@ -300,6 +318,7 @@ impl OxidArt {
         }
     }
     pub fn del(&mut self, key: Bytes) -> Option<Bytes> {
+        debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
             let old_val = self.get_node_mut(self.root_idx).val.take();
@@ -316,9 +335,9 @@ impl OxidArt {
         let target_idx = loop {
             let node = self.try_get_node(idx)?;
             match node.compare_compression_key(&key[cursor..]) {
-                CompResult::CompIsFinal => break idx,
-                CompResult::CompIsPartial(_) => return None,
-                CompResult::CompIsPath => {
+                CompResult::Final => break idx,
+                CompResult::Partial(_) => return None,
+                CompResult::Path => {
                     cursor += node.compression.len();
                 }
             }
@@ -357,6 +376,7 @@ impl OxidArt {
 
     /// Supprime toutes les clés commençant par `prefix`, retourne le nombre supprimé
     pub fn deln(&mut self, prefix: Bytes) -> usize {
+        debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
         let prefix_len = prefix.len();
 
         if prefix_len == 0 {
@@ -386,8 +406,8 @@ impl OxidArt {
             };
 
             match node.compare_compression_key(&prefix[cursor..]) {
-                CompResult::CompIsFinal => break idx,
-                CompResult::CompIsPartial(common_len) => {
+                CompResult::Final => break idx,
+                CompResult::Partial(common_len) => {
                     // Le préfixe se termine dans la compression?
                     let prefix_rest_len = prefix_len - cursor;
                     if common_len == prefix_rest_len {
@@ -396,7 +416,7 @@ impl OxidArt {
                     // Divergence, rien à supprimer
                     return 0;
                 }
-                CompResult::CompIsPath => {
+                CompResult::Path => {
                     cursor += node.compression.len();
                 }
             }
@@ -436,11 +456,11 @@ impl OxidArt {
             indices.push(child_idx);
         }
 
-        if let Some(huge_idx) = node.childs.get_next_idx() {
-            if let Some(huge_childs) = self.child_list.get(huge_idx as usize) {
-                for (_, child_idx) in huge_childs.iter() {
-                    indices.push(child_idx);
-                }
+        if let Some(huge_idx) = node.childs.get_next_idx()
+            && let Some(huge_childs) = self.child_list.get(huge_idx as usize)
+        {
+            for (_, child_idx) in huge_childs.iter() {
+                indices.push(child_idx);
             }
         }
 
@@ -462,10 +482,10 @@ impl OxidArt {
                 let mut children: Vec<u32> = node.childs.iter().map(|(_, idx)| idx).collect();
 
                 let huge_idx = node.childs.get_next_idx();
-                if let Some(hi) = huge_idx {
-                    if let Some(huge_childs) = self.child_list.get(hi as usize) {
-                        children.extend(huge_childs.iter().map(|(_, idx)| idx));
-                    }
+                if let Some(hi) = huge_idx
+                    && let Some(huge_childs) = self.child_list.get(hi as usize)
+                {
+                    children.extend(huge_childs.iter().map(|(_, idx)| idx));
                 }
 
                 (children, node.val.is_some(), huge_idx)
@@ -535,9 +555,9 @@ struct Node {
 }
 enum CompResult {
     ///The compresion completely part of the key need travel for more
-    CompIsPath,
-    CompIsFinal,
-    CompIsPartial(usize),
+    Path,
+    Final,
+    Partial(usize),
 }
 
 impl Node {
@@ -547,24 +567,26 @@ impl Node {
             Equal => {
                 let common_len = self.get_common_len(key_rest);
                 if common_len == key_rest.len() {
-                    CompResult::CompIsFinal
+                    CompResult::Final
                 } else {
-                    CompResult::CompIsPartial(common_len)
+                    CompResult::Partial(common_len)
                 }
             }
-            Greater => CompResult::CompIsPartial(self.get_common_len(key_rest)),
+            Greater => CompResult::Partial(self.get_common_len(key_rest)),
             Less => {
                 let common_len = self.get_common_len(key_rest);
                 if common_len == self.compression.len() {
-                    CompResult::CompIsPath
+                    CompResult::Path
                 } else {
-                    CompResult::CompIsPartial(common_len)
+                    CompResult::Partial(common_len)
                 }
             }
         }
     }
+    #[allow(clippy::needless_range_loop)]
     fn get_common_len(&self, key_rest: &[u8]) -> usize {
         let len = self.compression.len().min(key_rest.len());
+
         for i in 0..len {
             if self.compression[i] != key_rest[i] {
                 return i;

@@ -4,6 +4,7 @@ pub(crate) const CHILDS_SIZE: usize = 10;
 const ASCII_MAX_CHAR: usize = 127;
 pub(crate) const HUGE_CHILDS_SIZE: usize = ASCII_MAX_CHAR - CHILDS_SIZE;
 
+#[repr(C, align(64))]
 pub(crate) struct Childs {
     idxs: ArrayVec<u32, CHILDS_SIZE>,
     radixs: ArrayVec<u8, CHILDS_SIZE>,
@@ -80,46 +81,49 @@ impl Childs {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct HugeChildRegistry {
+    radix: u8,
+    idx: u32,
+}
+
+#[repr(align(64))]
 #[derive(Default)]
 pub(crate) struct HugeChilds {
-    radixs: ArrayVec<u8, HUGE_CHILDS_SIZE>,
-    idxs: ArrayVec<u32, HUGE_CHILDS_SIZE>,
+    entries: ArrayVec<HugeChildRegistry, HUGE_CHILDS_SIZE>,
 }
+
 impl HugeChilds {
     pub(crate) fn new(radix: u8, idx: u32) -> Self {
-        let mut radixs = ArrayVec::new_const();
-        radixs.push(radix);
-        let mut idxs = ArrayVec::new_const();
-        idxs.push(idx);
-
-        Self { radixs, idxs }
+        let mut entries = ArrayVec::new_const();
+        entries.push(HugeChildRegistry { radix, idx });
+        Self { entries }
     }
 }
 
 impl ChildAble for HugeChilds {
     fn find(&self, radix: u8) -> Option<u32> {
-        self.radixs
+        self.entries
             .iter()
-            .position(|&c| c == radix)
-            .map(|i| self.idxs[i])
+            .find(|e| e.radix == radix)
+            .map(|e| e.idx)
     }
 
     fn push(&mut self, radix: u8, idx: u32) {
-        self.idxs.push(idx);
-        self.radixs.push(radix);
+        self.entries.push(HugeChildRegistry { radix, idx });
     }
 
     fn remove(&mut self, radix: u8) -> Option<u32> {
-        let pos = self.radixs.iter().position(|&c| c == radix)?;
-        self.radixs.swap_remove(pos);
-        Some(self.idxs.swap_remove(pos))
+        let pos = self.entries.iter().position(|e| e.radix == radix)?;
+        Some(self.entries.swap_remove(pos).idx)
     }
 
     fn is_empty(&self) -> bool {
-        self.idxs.is_empty()
+        self.entries.is_empty()
     }
 
     fn iter(&self) -> impl Iterator<Item = (u8, u32)> {
-        self.radixs.iter().copied().zip(self.idxs.iter().copied())
+        self.entries.iter().map(|e| (e.radix, e.idx))
     }
 }
