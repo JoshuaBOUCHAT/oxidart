@@ -1,3 +1,47 @@
+//! # OxidArt
+//!
+//! A high-performance, compressed Adaptive Radix Tree (ART) implementation in Rust
+//! for fast key-value storage operations.
+//!
+//! ## Features
+//!
+//! - **O(k) operations**: All operations (get, set, del) run in O(k) time where k is the key length
+//! - **Path compression**: Minimizes memory usage by compressing single-child paths
+//! - **Prefix operations**: Supports `getn` and `deln` for prefix-based queries and deletions
+//! - **Zero-copy values**: Uses `bytes::Bytes` for efficient value handling
+//!
+//! ## Example
+//!
+//! ```rust
+//! use oxidart::OxidArt;
+//! use bytes::Bytes;
+//!
+//! let mut tree = OxidArt::new();
+//!
+//! // Insert key-value pairs
+//! tree.set(Bytes::from_static(b"hello"), Bytes::from_static(b"world"));
+//! tree.set(Bytes::from_static(b"hello:foo"), Bytes::from_static(b"bar"));
+//!
+//! // Retrieve a value
+//! assert_eq!(tree.get(Bytes::from_static(b"hello")), Some(Bytes::from_static(b"world")));
+//!
+//! // Get all entries with a prefix
+//! let entries = tree.getn(Bytes::from_static(b"hello"));
+//! assert_eq!(entries.len(), 2);
+//!
+//! // Delete a key
+//! let deleted = tree.del(Bytes::from_static(b"hello"));
+//! assert_eq!(deleted, Some(Bytes::from_static(b"world")));
+//!
+//! // Delete all keys with a prefix
+//! let count = tree.deln(Bytes::from_static(b"hello"));
+//! assert_eq!(count, 1);
+//! ```
+//!
+//! ## Key Requirements
+//!
+//! Keys must be valid ASCII bytes. Non-ASCII keys will trigger a debug assertion.
+
 mod node_childs;
 #[cfg(test)]
 mod test;
@@ -10,6 +54,22 @@ use crate::node_childs::ChildAble;
 use crate::node_childs::Childs;
 use crate::node_childs::HugeChilds;
 
+/// A compressed Adaptive Radix Tree for fast key-value storage.
+///
+/// `OxidArt` provides O(k) time complexity for all operations where k is the key length.
+/// It uses path compression to minimize memory footprint while maintaining high performance.
+///
+/// # Example
+///
+/// ```rust
+/// use oxidart::OxidArt;
+/// use bytes::Bytes;
+///
+/// let mut tree = OxidArt::new();
+/// tree.set(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
+///
+/// assert_eq!(tree.get(Bytes::from_static(b"key")), Some(Bytes::from_static(b"value")));
+/// ```
 pub struct OxidArt {
     pub(crate) map: Slab<Node>,
     pub(crate) child_list: Slab<HugeChilds>,
@@ -23,6 +83,17 @@ impl Default for OxidArt {
 }
 
 impl OxidArt {
+    /// Creates a new empty `OxidArt` tree.
+    ///
+    /// The tree is pre-allocated with capacity for 1024 nodes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxidart::OxidArt;
+    ///
+    /// let tree = OxidArt::new();
+    /// ```
     pub fn new() -> Self {
         let mut map = Slab::with_capacity(1024);
 
@@ -76,6 +147,26 @@ impl OxidArt {
     }
 }
 impl OxidArt {
+    /// Retrieves the value associated with the given key.
+    ///
+    /// Returns `Some(value)` if the key exists, or `None` if it doesn't.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to look up. Must be valid ASCII.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxidart::OxidArt;
+    /// use bytes::Bytes;
+    ///
+    /// let mut tree = OxidArt::new();
+    /// tree.set(Bytes::from_static(b"hello"), Bytes::from_static(b"world"));
+    ///
+    /// assert_eq!(tree.get(Bytes::from_static(b"hello")), Some(Bytes::from_static(b"world")));
+    /// assert_eq!(tree.get(Bytes::from_static(b"missing")), None);
+    /// ```
     pub fn get(&self, key: Bytes) -> Option<Bytes> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
@@ -89,7 +180,7 @@ impl OxidArt {
         loop {
             idx = self.find(idx, key[cursor])?;
             let node = self.try_get_node(idx)?;
-            //on passe dans le node donc le cursor augmente de 1
+            // Entering the node, increment cursor by 1
             cursor += 1;
             match node.compare_compression_key(&key[cursor..]) {
                 CompResult::Final => return node.val.clone(),
@@ -101,7 +192,32 @@ impl OxidArt {
         }
     }
 
-    /// Retourne tous les (clé, valeur) dont la clé commence par `prefix`
+    /// Returns all key-value pairs where the key starts with the given prefix.
+    ///
+    /// If the prefix is empty, returns all entries in the tree.
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix` - The prefix to match. Must be valid ASCII.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(key, value)` tuples for all matching entries.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxidart::OxidArt;
+    /// use bytes::Bytes;
+    ///
+    /// let mut tree = OxidArt::new();
+    /// tree.set(Bytes::from_static(b"user:1"), Bytes::from_static(b"alice"));
+    /// tree.set(Bytes::from_static(b"user:2"), Bytes::from_static(b"bob"));
+    /// tree.set(Bytes::from_static(b"post:1"), Bytes::from_static(b"hello"));
+    ///
+    /// let users = tree.getn(Bytes::from_static(b"user:"));
+    /// assert_eq!(users.len(), 2);
+    /// ```
     pub fn getn(&self, prefix: Bytes) -> Vec<(Bytes, Bytes)> {
         debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
         let mut results = Vec::new();
@@ -112,7 +228,7 @@ impl OxidArt {
             return results;
         }
 
-        // Parcours identique à get, on track le chemin réel
+        // Traverse like get, tracking the actual path
         let mut idx = self.root_idx;
         let mut cursor = 0;
         let mut key_path: Vec<u8> = Vec::new();
@@ -132,7 +248,7 @@ impl OxidArt {
 
             match node.compare_compression_key(&prefix[cursor..]) {
                 CompResult::Final => {
-                    // Préfixe exact trouvé
+                    // Exact prefix found
                     key_path.extend_from_slice(&node.compression);
                     self.collect_all_from(idx, key_path, &mut results);
                     return results;
@@ -140,7 +256,7 @@ impl OxidArt {
                 CompResult::Partial(common_len) => {
                     let prefix_rest_len = prefix_len - cursor;
                     if common_len == prefix_rest_len {
-                        // Préfixe se termine dans la compression
+                        // Prefix ends within the compression
                         key_path.extend_from_slice(&node.compression);
                         self.collect_all_from(idx, key_path, &mut results);
                     }
@@ -154,7 +270,7 @@ impl OxidArt {
         }
     }
 
-    /// Collecte depuis un node dont la clé est déjà complète dans key_path
+    /// Collects from a node whose key is already complete in key_path
     fn collect_all_from(
         &self,
         node_idx: u32,
@@ -176,7 +292,7 @@ impl OxidArt {
         });
     }
 
-    /// Collecte récursivement, ajoute la compression du node
+    /// Recursively collects, adding the node's compression
     fn collect_all(
         &self,
         node_idx: u32,
@@ -200,7 +316,7 @@ impl OxidArt {
         });
     }
 
-    /// Itère sur tous les enfants d'un node (childs + huge_childs)
+    /// Iterates over all children of a node (childs + huge_childs)
     fn iter_all_children<F>(&self, node_idx: u32, mut f: F)
     where
         F: FnMut(u8, u32),
@@ -221,6 +337,32 @@ impl OxidArt {
             }
         }
     }
+
+    /// Inserts or updates a key-value pair in the tree.
+    ///
+    /// If the key already exists, the value is replaced.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert. Must be valid ASCII.
+    /// * `val` - The value to associate with the key.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxidart::OxidArt;
+    /// use bytes::Bytes;
+    ///
+    /// let mut tree = OxidArt::new();
+    ///
+    /// // Insert a new key
+    /// tree.set(Bytes::from_static(b"key"), Bytes::from_static(b"value1"));
+    ///
+    /// // Update an existing key
+    /// tree.set(Bytes::from_static(b"key"), Bytes::from_static(b"value2"));
+    ///
+    /// assert_eq!(tree.get(Bytes::from_static(b"key")), Some(Bytes::from_static(b"value2")));
+    /// ```
     pub fn set(&mut self, key: Bytes, val: Bytes) {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
@@ -237,7 +379,7 @@ impl OxidArt {
                 return;
             };
             idx = child_idx;
-            //on passe dans le node donc le cursor augmente de 1
+            // Entering the node, increment cursor by 1
             cursor += 1;
             let node_comparaison = self.get_node(idx).compare_compression_key(&key[cursor..]);
             let common_len = match node_comparaison {
@@ -252,11 +394,11 @@ impl OxidArt {
                 CompResult::Partial(common_len) => common_len,
             };
 
-            // Split: la compression du node ne match que partiellement la clé
+            // Split: node compression only partially matches the key
             let key_rest = &key[cursor..];
             let val_on_intermediate = common_len == key_rest.len();
 
-            // Extraire l'ancien état et configurer l'intermédiaire en une passe
+            // Extract old state and configure intermediate in one pass
             let (old_compression, old_val, old_childs) = {
                 let node = self.get_node_mut(idx);
                 let old_compression = std::mem::take(&mut node.compression);
@@ -271,7 +413,7 @@ impl OxidArt {
                 (old_compression, old_val, old_childs)
             };
 
-            // Créer un node pour l'ancien contenu
+            // Create a node for the old content
             let old_radix = old_compression[common_len];
             let old_child = Node {
                 compression: SmallVec::from_slice(&old_compression[common_len + 1..]),
@@ -281,7 +423,7 @@ impl OxidArt {
             let old_child_idx = self.insert(old_child);
             self.get_node_mut(idx).childs.push(old_radix, old_child_idx);
 
-            // Si la valeur ne va pas sur l'intermédiaire, créer un nouveau leaf
+            // If the value doesn't go on the intermediate node, create a new leaf
             if !val_on_intermediate {
                 let new_radix = key_rest[common_len];
                 let new_compression = &key_rest[common_len + 1..];
@@ -317,6 +459,31 @@ impl OxidArt {
             }
         }
     }
+
+    /// Deletes a key from the tree and returns its value.
+    ///
+    /// Returns `Some(value)` if the key existed, or `None` if it didn't.
+    /// The tree automatically recompresses paths after deletion.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to delete. Must be valid ASCII.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxidart::OxidArt;
+    /// use bytes::Bytes;
+    ///
+    /// let mut tree = OxidArt::new();
+    /// tree.set(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
+    ///
+    /// let deleted = tree.del(Bytes::from_static(b"key"));
+    /// assert_eq!(deleted, Some(Bytes::from_static(b"value")));
+    ///
+    /// // Key no longer exists
+    /// assert_eq!(tree.get(Bytes::from_static(b"key")), None);
+    /// ```
     pub fn del(&mut self, key: Bytes) -> Option<Bytes> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
@@ -326,7 +493,7 @@ impl OxidArt {
             return old_val;
         }
 
-        // Parcours comme get, on garde juste le parent immédiat
+        // Traverse like get, keeping track of the immediate parent
         let mut parent_idx = self.root_idx;
         let mut parent_radix = key[0];
         let mut idx = self.find(parent_idx, parent_radix)?;
@@ -342,31 +509,31 @@ impl OxidArt {
                 }
             }
 
-            // Continuer la traversée
+            // Continue traversal
             parent_idx = idx;
             parent_radix = key[cursor];
             idx = self.find(idx, parent_radix)?;
             cursor += 1;
         };
 
-        // Check si le node a des enfants
+        // Check if the node has children
         let has_children = {
             let node = self.get_node(target_idx);
             !node.childs.is_empty() || node.childs.get_next_idx().is_some()
         };
 
         if has_children {
-            // Node avec enfants: on garde le node, juste supprimer la valeur
+            // Node with children: keep the node, just remove the value
             let old_val = self.get_node_mut(target_idx).val.take()?;
-            // Tenter recompression (absorbe l'unique enfant si possible)
+            // Try recompression (absorb the single child if possible)
             self.try_recompress(target_idx);
             Some(old_val)
         } else {
-            // Node sans enfants (leaf): on supprime complètement le node de la slab
+            // Node without children (leaf): completely remove from the slab
             let node = self.map.remove(target_idx as usize);
             let old_val = node.val?;
             self.remove_child(parent_idx, parent_radix);
-            // Tenter recompression sur le parent (sauf root)
+            // Try recompression on the parent (except root)
             if parent_idx != self.root_idx {
                 self.try_recompress(parent_idx);
             }
@@ -374,25 +541,51 @@ impl OxidArt {
         }
     }
 
-    /// Supprime toutes les clés commençant par `prefix`, retourne le nombre supprimé
+    /// Deletes all keys that start with the given prefix.
+    ///
+    /// Returns the number of key-value pairs that were deleted.
+    /// If the prefix is empty, all entries are deleted.
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix` - The prefix to match. Must be valid ASCII.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxidart::OxidArt;
+    /// use bytes::Bytes;
+    ///
+    /// let mut tree = OxidArt::new();
+    /// tree.set(Bytes::from_static(b"user:1"), Bytes::from_static(b"alice"));
+    /// tree.set(Bytes::from_static(b"user:2"), Bytes::from_static(b"bob"));
+    /// tree.set(Bytes::from_static(b"post:1"), Bytes::from_static(b"hello"));
+    ///
+    /// // Delete all user entries
+    /// let count = tree.deln(Bytes::from_static(b"user:"));
+    /// assert_eq!(count, 2);
+    ///
+    /// // Only post entries remain
+    /// assert_eq!(tree.getn(Bytes::from_static(b"")).len(), 1);
+    /// ```
     pub fn deln(&mut self, prefix: Bytes) -> usize {
         debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
         let prefix_len = prefix.len();
 
         if prefix_len == 0 {
-            // Supprimer tout depuis la racine (garder le node racine, vider son contenu)
+            // Delete everything from root (keep root node, clear its content)
             let root = self.get_node_mut(self.root_idx);
             let had_val = root.val.take().is_some();
             let childs_to_free: Vec<u32> = self.collect_child_indices(self.root_idx);
 
-            // Vider les enfants de la racine (note: huge_childs de root pas libéré, négligeable)
+            // Clear children of root (note: root's huge_childs not freed, negligible)
             self.get_node_mut(self.root_idx).childs = Childs::default();
 
             let freed = self.free_subtree_iterative(childs_to_free);
             return freed + if had_val { 1 } else { 0 };
         }
 
-        // Parcours comme del
+        // Traverse like del
         let mut parent_idx = self.root_idx;
         let mut parent_radix = prefix[0];
         let Some(mut idx) = self.find(parent_idx, parent_radix) else {
@@ -408,12 +601,12 @@ impl OxidArt {
             match node.compare_compression_key(&prefix[cursor..]) {
                 CompResult::Final => break idx,
                 CompResult::Partial(common_len) => {
-                    // Le préfixe se termine dans la compression?
+                    // Does the prefix end within the compression?
                     let prefix_rest_len = prefix_len - cursor;
                     if common_len == prefix_rest_len {
                         break idx;
                     }
-                    // Divergence, rien à supprimer
+                    // Divergence, nothing to delete
                     return 0;
                 }
                 CompResult::Path => {
@@ -421,7 +614,7 @@ impl OxidArt {
                 }
             }
 
-            // Continuer la traversée
+            // Continue traversal
             parent_idx = idx;
             parent_radix = prefix[cursor];
             let Some(child_idx) = self.find(idx, parent_radix) else {
@@ -431,13 +624,13 @@ impl OxidArt {
             cursor += 1;
         };
 
-        // Couper le lien depuis le parent
+        // Cut the link from parent
         self.remove_child(parent_idx, parent_radix);
 
-        // Libérer tout le sous-arbre (DFS itératif)
+        // Free the entire subtree (iterative DFS)
         let count = self.free_subtree_iterative(vec![target_idx]);
 
-        // Recompression du parent (sauf root car get ne gère pas root avec compression)
+        // Recompression of parent (except root since get doesn't handle root with compression)
         if parent_idx != self.root_idx {
             self.try_recompress(parent_idx);
         }
@@ -445,7 +638,7 @@ impl OxidArt {
         count
     }
 
-    /// Collecte tous les indices d'enfants d'un node
+    /// Collects all child indices of a node
     fn collect_child_indices(&self, node_idx: u32) -> Vec<u32> {
         let mut indices = Vec::new();
         let Some(node) = self.try_get_node(node_idx) else {
@@ -467,13 +660,13 @@ impl OxidArt {
         indices
     }
 
-    /// Libère un sous-arbre de manière itérative (DFS), retourne le nombre de valeurs supprimées
+    /// Frees a subtree iteratively (DFS), returns the number of deleted values
     fn free_subtree_iterative(&mut self, initial_nodes: Vec<u32>) -> usize {
         let mut stack = initial_nodes;
         let mut count = 0;
 
         while let Some(node_idx) = stack.pop() {
-            // Collecter les enfants avant de supprimer le node
+            // Collect children before removing the node
             let (children, has_val, huge_child_idx) = {
                 let Some(node) = self.try_get_node(node_idx) else {
                     continue;
@@ -491,27 +684,27 @@ impl OxidArt {
                 (children, node.val.is_some(), huge_idx)
             };
 
-            // Ajouter les enfants à la stack
+            // Add children to the stack
             stack.extend(children);
 
-            // Compter si avait une valeur
+            // Count if it had a value
             if has_val {
                 count += 1;
             }
 
-            // Supprimer le huge_childs si présent
+            // Remove huge_childs if present
             if let Some(huge_idx) = huge_child_idx {
                 self.child_list.remove(huge_idx as usize);
             }
 
-            // Supprimer le node de la slab
+            // Remove the node from the slab
             self.map.remove(node_idx as usize);
         }
 
         count
     }
 
-    /// Si le node a exactement 1 enfant et pas de valeur, absorbe l'enfant
+    /// If the node has exactly 1 child and no value, absorb the child
     fn try_recompress(&mut self, node_idx: u32) {
         let node = self.get_node(node_idx);
         if node.val.is_some() {
@@ -522,7 +715,7 @@ impl OxidArt {
             return;
         };
 
-        // Absorber l'enfant: compression = current + radix + child.compression
+        // Absorb the child: compression = current + radix + child.compression
         let child = self.map.remove(child_idx as usize);
         let node = self.get_node_mut(node_idx);
 
@@ -537,7 +730,7 @@ impl OxidArt {
         if parent.childs.remove(radix).is_some() {
             return;
         }
-        // Sinon c'est dans huge_childs
+        // Otherwise it's in huge_childs
         if let Some(huge_idx) = parent.childs.get_next_idx() {
             self.child_list
                 .get_mut(huge_idx as usize)
