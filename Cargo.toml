@@ -16,3 +16,7 @@ arrayvec = "0.7.6"
 bytes = "1.11.0"
 slab = "0.4.11"
 smallvec = "1.15.1"
+
+[features]
+default = ["ttl"]
+ttl = []

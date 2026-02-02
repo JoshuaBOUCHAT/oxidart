@@ -43,6 +43,7 @@
 //! Keys must be valid ASCII bytes. Non-ASCII keys will trigger a debug assertion.
 
 mod node_childs;
+
 #[cfg(test)]
 mod test;
 
@@ -70,9 +71,11 @@ use crate::node_childs::HugeChilds;
 ///
 /// assert_eq!(tree.get(Bytes::from_static(b"key")), Some(Bytes::from_static(b"value")));
 /// ```
+///
 pub struct OxidArt {
     pub(crate) map: Slab<Node>,
     pub(crate) child_list: Slab<HugeChilds>,
+    #[cfg(feature = "ttl")]
     versions: Vec<u32>,
     root_idx: u32,
 }
@@ -96,25 +99,35 @@ impl OxidArt {
     /// ```
     pub fn new() -> Self {
         let mut map = Slab::with_capacity(1024);
-
         let root_idx = map.insert(Node::default()) as u32;
-        let versions = vec![root_idx];
         let child_list = Slab::with_capacity(32);
+
+        // On ne crée le vecteur que si la feature est là
+        #[cfg(feature = "ttl")]
+        let versions = vec![0]; // Initialise avec 0 pour le root par exemple
 
         Self {
             map,
             root_idx,
-            versions,
             child_list,
+            // On n'ajoute le champ dans l'instanciation que si la feature est là
+            #[cfg(feature = "ttl")]
+            versions,
         }
     }
     fn insert(&mut self, node: Node) -> u32 {
         let idx = self.map.insert(node) as u32;
-        if self.versions.len() == idx as usize {
-            self.versions.push(0);
-        } else {
-            self.versions[idx as usize] += 1;
+
+        // Ce bloc disparaît complètement de la compilation si "ttl" n'est pas actif
+        #[cfg(feature = "ttl")]
+        {
+            if self.versions.len() == idx as usize {
+                self.versions.push(0);
+            } else {
+                self.versions[idx as usize] += 1;
+            }
         }
+
         idx
     }
     fn get_node(&self, idx: u32) -> &Node {
@@ -167,11 +180,11 @@ impl OxidArt {
     /// assert_eq!(tree.get(Bytes::from_static(b"hello")), Some(Bytes::from_static(b"world")));
     /// assert_eq!(tree.get(Bytes::from_static(b"missing")), None);
     /// ```
-    pub fn get(&self, key: Bytes) -> Option<Bytes> {
+    pub fn get(&self, key: Bytes,) -> Option<Bytes> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
-            return self.try_get_node(self.root_idx)?.val.clone();
+            return Some(self.try_get_node(self.root_idx).cloned()?.);
         }
 
         let mut idx = self.root_idx;
@@ -183,7 +196,7 @@ impl OxidArt {
             // Entering the node, increment cursor by 1
             cursor += 1;
             match node.compare_compression_key(&key[cursor..]) {
-                CompResult::Final => return node.val.clone(),
+                CompResult::Final => return Some(node.val?.0.clone()),
                 CompResult::Partial(_) => return None,
                 CompResult::Path => {
                     cursor += node.compression.len();
@@ -363,7 +376,7 @@ impl OxidArt {
     ///
     /// assert_eq!(tree.get(Bytes::from_static(b"key")), Some(Bytes::from_static(b"value2")));
     /// ```
-    pub fn set(&mut self, key: Bytes, val: Bytes) {
+    pub fn set(&mut self, key: Bytes,#[cfg(feature = "ttl")] ttl: Option<u64>, val: Bytes) {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
@@ -740,6 +753,15 @@ impl OxidArt {
     }
 }
 
+#[cfg(feature = "ttl")]
+#[derive(Default)]
+struct Node {
+    childs: Childs,
+    compression: SmallVec<[u8; 8]>,
+    val: Option<(Bytes, u64)>,
+}
+
+#[cfg(not(feature = "ttl"))]
 #[derive(Default)]
 struct Node {
     compression: SmallVec<[u8; 23]>,
