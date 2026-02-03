@@ -418,7 +418,7 @@ impl OxidArt {
         }
     }
 
-    /// Inserts or updates a key-value pair in the tree.
+    /// Inserts or updates a key-value pair in the tree (no expiration).
     ///
     /// If the key already exists, the value is replaced.
     ///
@@ -443,15 +443,121 @@ impl OxidArt {
     ///
     /// assert_eq!(tree.get(Bytes::from_static(b"key")), Some(Bytes::from_static(b"value2")));
     /// ```
-    pub fn set(&mut self, key: Bytes, #[cfg(feature = "ttl")] ttl: Option<u64>, val: Bytes) {
-        debug_assert!(key.is_ascii(), "key must be ASCII");
+    pub fn set(&mut self, key: Bytes, val: Bytes) {
         #[cfg(feature = "ttl")]
-        let ttl = ttl.unwrap_or(NO_EXPIRY);
+        self.set_internal(key, NO_EXPIRY, val);
+        #[cfg(not(feature = "ttl"))]
+        self.set_internal(key, val);
+    }
+
+    /// Inserts or updates a key-value pair with a time-to-live duration.
+    ///
+    /// The key will expire after `ttl` duration from the current timestamp (`self.now`).
+    /// Make sure to call `tick()` or `set_now()` to keep the internal clock updated.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert. Must be valid ASCII.
+    /// * `ttl` - Duration after which the key expires.
+    /// * `val` - The value to associate with the key.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use oxidart::OxidArt;
+    /// use bytes::Bytes;
+    /// use std::time::Duration;
+    ///
+    /// let mut tree = OxidArt::new();
+    /// tree.set_now(1000); // Set current time
+    ///
+    /// // Insert with 60 second TTL
+    /// tree.set_ttl(Bytes::from_static(b"session"), Duration::from_secs(60), Bytes::from_static(b"data"));
+    ///
+    /// // Key expires at timestamp 1060
+    /// ```
+    #[cfg(feature = "ttl")]
+    pub fn set_ttl(&mut self, key: Bytes, ttl: std::time::Duration, val: Bytes) {
+        let expires_at = self.now.saturating_add(ttl.as_secs());
+        self.set_internal(key, expires_at, val);
+    }
+
+    #[cfg(feature = "ttl")]
+    fn set_internal(&mut self, key: Bytes, ttl: u64, val: Bytes) {
+        debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
-            #[cfg(feature = "ttl")]
             self.get_node_mut(self.root_idx).set_val(val, ttl);
-            #[cfg(not(feature = "ttl"))]
+            return;
+        }
+        let mut idx = self.root_idx;
+        let mut cursor = 0;
+
+        loop {
+            let Some(child_idx) = self.find(idx, key[cursor]) else {
+                self.create_node_with_val(idx, key[cursor], val, &key[(cursor + 1)..], ttl);
+                return;
+            };
+            idx = child_idx;
+            cursor += 1;
+            let node_comparaison = self.get_node(idx).compare_compression_key(&key[cursor..]);
+            let common_len = match node_comparaison {
+                CompResult::Final => {
+                    self.get_node_mut(idx).set_val(val, ttl);
+                    return;
+                }
+                CompResult::Path => {
+                    cursor += self.get_node(idx).compression.len();
+                    continue;
+                }
+                CompResult::Partial(common_len) => common_len,
+            };
+
+            // Split: node compression only partially matches the key
+            let key_rest = &key[cursor..];
+            let val_on_intermediate = common_len == key_rest.len();
+
+            // Extract old state and configure intermediate in one pass
+            let (old_compression, old_val, old_childs) = {
+                let node = self.get_node_mut(idx);
+                let old_compression = std::mem::take(&mut node.compression);
+                let old_val = node.val.take();
+                let old_childs = std::mem::take(&mut node.childs);
+
+                node.compression = SmallVec::from_slice(&old_compression[..common_len]);
+                if val_on_intermediate {
+                    node.val = Some((val.clone(), ttl));
+                }
+
+                (old_compression, old_val, old_childs)
+            };
+
+            // Create a node for the old content
+            let old_radix = old_compression[common_len];
+            let old_child = Node {
+                compression: SmallVec::from_slice(&old_compression[common_len + 1..]),
+                val: old_val,
+                childs: old_childs,
+            };
+            let old_child_idx = self.insert(old_child);
+            self.get_node_mut(idx).childs.push(old_radix, old_child_idx);
+
+            // If the value doesn't go on the intermediate node, create a new leaf
+            if !val_on_intermediate {
+                let new_radix = key_rest[common_len];
+                let new_compression = &key_rest[common_len + 1..];
+                self.create_node_with_val(idx, new_radix, val, new_compression, ttl);
+            }
+
+            return;
+        }
+    }
+
+    #[cfg(not(feature = "ttl"))]
+    fn set_internal(&mut self, key: Bytes, val: Bytes) {
+        debug_assert!(key.is_ascii(), "key must be ASCII");
+        let key_len = key.len();
+        if key_len == 0 {
             self.get_node_mut(self.root_idx).set_val(val);
             return;
         }
@@ -460,9 +566,6 @@ impl OxidArt {
 
         loop {
             let Some(child_idx) = self.find(idx, key[cursor]) else {
-                #[cfg(feature = "ttl")]
-                self.create_node_with_val(idx, key[cursor], val, &key[(cursor + 1)..], ttl);
-                #[cfg(not(feature = "ttl"))]
                 self.create_node_with_val(idx, key[cursor], val, &key[(cursor + 1)..]);
                 return;
             };
@@ -471,9 +574,6 @@ impl OxidArt {
             let node_comparaison = self.get_node(idx).compare_compression_key(&key[cursor..]);
             let common_len = match node_comparaison {
                 CompResult::Final => {
-                    #[cfg(feature = "ttl")]
-                    self.get_node_mut(idx).set_val(val, ttl);
-                    #[cfg(not(feature = "ttl"))]
                     self.get_node_mut(idx).set_val(val);
                     return;
                 }
@@ -497,14 +597,7 @@ impl OxidArt {
 
                 node.compression = SmallVec::from_slice(&old_compression[..common_len]);
                 if val_on_intermediate {
-                    #[cfg(feature = "ttl")]
-                    {
-                        node.val = Some((val.clone(), ttl));
-                    }
-                    #[cfg(not(feature = "ttl"))]
-                    {
-                        node.val = Some(val.clone());
-                    }
+                    node.val = Some(val.clone());
                 }
 
                 (old_compression, old_val, old_childs)
@@ -524,9 +617,6 @@ impl OxidArt {
             if !val_on_intermediate {
                 let new_radix = key_rest[common_len];
                 let new_compression = &key_rest[common_len + 1..];
-                #[cfg(feature = "ttl")]
-                self.create_node_with_val(idx, new_radix, val, new_compression, ttl);
-                #[cfg(not(feature = "ttl"))]
                 self.create_node_with_val(idx, new_radix, val, new_compression);
             }
 

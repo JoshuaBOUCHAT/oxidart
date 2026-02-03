@@ -97,19 +97,17 @@ mod tests {
 
         // Initial tick to set current time
         art.borrow_mut().tick();
-        let now = art.borrow().now;
 
         // batch:1 expires in 1 second
-        art.borrow_mut().set(
+        art.borrow_mut().set_ttl(
             Bytes::from_static(b"batch:1"),
-            Some(now + 1),
+            Duration::from_secs(1),
             Bytes::from_static(b"expires_soon"),
         );
 
         // batch:2 never expires
         art.borrow_mut().set(
             Bytes::from_static(b"batch:2"),
-            None,
             Bytes::from_static(b"forever"),
         );
 
