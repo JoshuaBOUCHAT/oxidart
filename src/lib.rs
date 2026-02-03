@@ -47,8 +47,15 @@
 
 mod node_childs;
 
+// Prevent enabling both async runtimes at once
+#[cfg(all(feature = "monoio", feature = "tokio"))]
+compile_error!("Features 'monoio' and 'tokio' are mutually exclusive. Please enable only one.");
+
 #[cfg(feature = "monoio")]
 pub mod monoio;
+
+#[cfg(feature = "tokio")]
+pub mod tokio;
 
 #[cfg(test)]
 mod test;
