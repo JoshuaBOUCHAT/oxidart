@@ -20,7 +20,7 @@ A blazingly fast Adaptive Radix Tree (ART) implementation in Rust with path comp
 
 ```toml
 [dependencies]
-oxidart = "0.1"
+oxidart = "0.2"
 bytes = "1"
 ```
 
