@@ -7,18 +7,15 @@
 //!
 //! ```rust,ignore
 //! use oxidart::OxidArt;
-//! use std::cell::RefCell;
-//! use std::rc::Rc;
 //! use std::time::Duration;
 //!
-//! #[monoio::main]
+//! #[monoio::main(enable_timer = true)]
 //! async fn main() {
-//!     let shared_art = Rc::new(RefCell::new(OxidArt::new()));
-//!
-//!     // Spawn ticker - updates timestamp every 100ms
-//!     oxidart::monoio::spawn_ticker(shared_art.clone(), Duration::from_millis(100));
+//!     // Recommended: creates shared tree with automatic ticker
+//!     let tree = OxidArt::shared_with_ticker(Duration::from_millis(100));
 //!
 //!     // Your server loop here...
+//!     tree.borrow_mut().set(/* ... */);
 //! }
 //! ```
 
@@ -27,12 +24,49 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+/// Shared OxidArt type for monoio (single-threaded).
+pub type SharedArt = Rc<RefCell<OxidArt>>;
+
 impl OxidArt {
+    /// Creates a new shared OxidArt with an automatic background ticker.
+    ///
+    /// This is the recommended constructor when using TTL features with monoio.
+    /// It returns an `Rc<RefCell<OxidArt>>` and spawns a background task that
+    /// periodically updates the internal timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval` - How often to update the timestamp (e.g., 100ms)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use oxidart::OxidArt;
+    /// use std::time::Duration;
+    ///
+    /// #[monoio::main(enable_timer = true)]
+    /// async fn main() {
+    ///     let tree = OxidArt::shared_with_ticker(Duration::from_millis(100));
+    ///
+    ///     tree.borrow_mut().set_ttl(
+    ///         Bytes::from_static(b"key"),
+    ///         Duration::from_secs(60),
+    ///         Bytes::from_static(b"value"),
+    ///     );
+    /// }
+    /// ```
+    pub fn shared_with_ticker(interval: Duration) -> SharedArt {
+        let art = Rc::new(RefCell::new(Self::new()));
+        art.borrow_mut().tick(); // Initial tick
+        spawn_ticker(art.clone(), interval);
+        art
+    }
+
     /// Updates the internal timestamp to the current system time.
     ///
     /// This is a convenience method for single-threaded async runtimes.
     /// Call this at the start of each event loop iteration, or use
-    /// [`spawn_ticker`] to automate this.
+    /// [`shared_with_ticker`](Self::shared_with_ticker) to automate this.
     #[inline]
     pub fn tick(&mut self) {
         self.now = std::time::SystemTime::now()
@@ -131,5 +165,28 @@ mod tests {
                 Bytes::from_static(b"forever")
             )
         );
+    }
+
+    #[monoio::test(enable_timer = true)]
+    async fn test_shared_with_ticker_constructor() {
+        // Use the convenience constructor
+        let art = OxidArt::shared_with_ticker(Duration::from_millis(100));
+
+        // Set a key with TTL
+        art.borrow_mut().set_ttl(
+            Bytes::from_static(b"test"),
+            Duration::from_secs(1),
+            Bytes::from_static(b"value"),
+        );
+
+        // Should exist initially
+        assert!(art.borrow_mut().get(Bytes::from_static(b"test")).is_some());
+
+        // Wait for expiration
+        monoio::time::sleep(Duration::from_secs(2)).await;
+        monoio::time::sleep(Duration::from_millis(150)).await;
+
+        // Should be expired
+        assert!(art.borrow_mut().get(Bytes::from_static(b"test")).is_none());
     }
 }

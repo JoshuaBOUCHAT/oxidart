@@ -10,18 +10,15 @@
 //!
 //! ```rust,ignore
 //! use oxidart::OxidArt;
-//! use std::sync::Arc;
-//! use tokio::sync::Mutex;
 //! use std::time::Duration;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let shared_art = Arc::new(Mutex::new(OxidArt::new()));
-//!
-//!     // Spawn ticker - updates timestamp every 100ms
-//!     oxidart::tokio::spawn_ticker(shared_art.clone(), Duration::from_millis(100));
+//!     // Recommended: creates shared tree with automatic ticker
+//!     let tree = OxidArt::shared_with_ticker(Duration::from_millis(100));
 //!
 //!     // Your server loop here...
+//!     tree.lock().await.set(/* ... */);
 //! }
 //! ```
 
@@ -30,12 +27,49 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// Shared OxidArt type for tokio (thread-safe).
+pub type SharedArt = Arc<Mutex<OxidArt>>;
+
 impl OxidArt {
+    /// Creates a new shared OxidArt with an automatic background ticker.
+    ///
+    /// This is the recommended constructor when using TTL features with tokio.
+    /// It returns an `Arc<Mutex<OxidArt>>` and spawns a background task that
+    /// periodically updates the internal timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval` - How often to update the timestamp (e.g., 100ms)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use oxidart::OxidArt;
+    /// use std::time::Duration;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let tree = OxidArt::shared_with_ticker(Duration::from_millis(100)).await;
+    ///
+    ///     tree.lock().await.set_ttl(
+    ///         Bytes::from_static(b"key"),
+    ///         Duration::from_secs(60),
+    ///         Bytes::from_static(b"value"),
+    ///     );
+    /// }
+    /// ```
+    pub async fn shared_with_ticker(interval: Duration) -> SharedArt {
+        let art = Arc::new(Mutex::new(Self::new()));
+        art.lock().await.tick(); // Initial tick
+        spawn_ticker(art.clone(), interval);
+        art
+    }
+
     /// Updates the internal timestamp to the current system time.
     ///
     /// This is a convenience method for async runtimes.
     /// Call this at the start of each event loop iteration, or use
-    /// [`spawn_ticker`] to automate this.
+    /// [`shared_with_ticker`](Self::shared_with_ticker) to automate this.
     #[inline]
     pub fn tick(&mut self) {
         self.now = std::time::SystemTime::now()
@@ -139,5 +173,28 @@ mod tests {
                 Bytes::from_static(b"forever")
             )
         );
+    }
+
+    #[tokio::test]
+    async fn test_shared_with_ticker_constructor() {
+        // Use the convenience constructor
+        let art = OxidArt::shared_with_ticker(Duration::from_millis(100)).await;
+
+        // Set a key with TTL
+        art.lock().await.set_ttl(
+            Bytes::from_static(b"test"),
+            Duration::from_secs(1),
+            Bytes::from_static(b"value"),
+        );
+
+        // Should exist initially
+        assert!(art.lock().await.get(Bytes::from_static(b"test")).is_some());
+
+        // Wait for expiration
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Should be expired
+        assert!(art.lock().await.get(Bytes::from_static(b"test")).is_none());
     }
 }

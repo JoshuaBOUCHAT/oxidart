@@ -15,30 +15,28 @@
 //! ```rust,ignore
 //! use oxidart::OxidArt;
 //! use bytes::Bytes;
+//! use std::time::Duration;
 //!
 //! let mut tree = OxidArt::new();
 //!
-//! // Insert key-value pairs (with TTL feature: None = no expiration, Some(ts) = expires at ts)
-//! tree.set(Bytes::from_static(b"hello"), None, Bytes::from_static(b"world"));
-//! tree.set(Bytes::from_static(b"hello:foo"), Some(1700000000), Bytes::from_static(b"bar"));
+//! // Insert key-value pairs
+//! tree.set(Bytes::from_static(b"hello"), Bytes::from_static(b"world"));
 //!
-//! // Update current time (server's responsibility)
-//! tree.set_now(1699999999);
+//! // Insert with TTL (requires `ttl` feature, enabled by default)
+//! tree.set_now(1700000000); // Update internal clock
+//! tree.set_ttl(Bytes::from_static(b"session"), Duration::from_secs(3600), Bytes::from_static(b"data"));
 //!
 //! // Retrieve a value
 //! assert_eq!(tree.get(Bytes::from_static(b"hello")), Some(Bytes::from_static(b"world")));
 //!
 //! // Get all entries with a prefix
 //! let entries = tree.getn(Bytes::from_static(b"hello"));
-//! assert_eq!(entries.len(), 2);
 //!
 //! // Delete a key
 //! let deleted = tree.del(Bytes::from_static(b"hello"));
-//! assert_eq!(deleted, Some(Bytes::from_static(b"world")));
 //!
 //! // Delete all keys with a prefix
 //! let count = tree.deln(Bytes::from_static(b"hello"));
-//! assert_eq!(count, 1);
 //! ```
 //!
 //! ## Key Requirements
