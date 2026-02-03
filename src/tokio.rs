@@ -1,0 +1,143 @@
+//! Tokio integration for OxidArt.
+//!
+//! This module provides async utilities for tokio runtimes (single or multi-threaded),
+//! including automatic timestamp management for TTL functionality.
+//!
+//! Since tokio supports multi-threaded runtimes, this module uses `Arc<tokio::sync::Mutex<T>>`
+//! for thread-safe shared access.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use oxidart::OxidArt;
+//! use std::sync::Arc;
+//! use tokio::sync::Mutex;
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let shared_art = Arc::new(Mutex::new(OxidArt::new()));
+//!
+//!     // Spawn ticker - updates timestamp every 100ms
+//!     oxidart::tokio::spawn_ticker(shared_art.clone(), Duration::from_millis(100));
+//!
+//!     // Your server loop here...
+//! }
+//! ```
+
+use crate::OxidArt;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+
+impl OxidArt {
+    /// Updates the internal timestamp to the current system time.
+    ///
+    /// This is a convenience method for async runtimes.
+    /// Call this at the start of each event loop iteration, or use
+    /// [`spawn_ticker`] to automate this.
+    #[inline]
+    pub fn tick(&mut self) {
+        self.now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before UNIX epoch")
+            .as_secs();
+    }
+}
+
+/// Spawns a background task that periodically updates the tree's internal timestamp.
+///
+/// This works with both single-threaded (`current_thread`) and multi-threaded tokio runtimes.
+/// The ticker runs cooperatively, updating at each `interval` to keep TTL checks accurate.
+///
+/// # Arguments
+///
+/// * `art` - A shared reference to the tree (`Arc<Mutex<OxidArt>>`)
+/// * `interval` - How often to update the timestamp (e.g., 100ms)
+///
+/// # Returns
+///
+/// A `JoinHandle` that can be used to abort the ticker if needed.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use oxidart::OxidArt;
+/// use std::sync::Arc;
+/// use tokio::sync::Mutex;
+/// use std::time::Duration;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let shared_art = Arc::new(Mutex::new(OxidArt::new()));
+///
+///     // Spawn ticker - updates every 100ms
+///     let ticker_handle = oxidart::tokio::spawn_ticker(shared_art.clone(), Duration::from_millis(100));
+///
+///     // Later, if you need to stop the ticker:
+///     // ticker_handle.abort();
+/// }
+/// ```
+pub fn spawn_ticker(
+    art: Arc<Mutex<OxidArt>>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval_timer = tokio::time::interval(interval);
+        loop {
+            interval_timer.tick().await;
+            art.lock().await.tick();
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn test_ttl_expiration_with_ticker() {
+        let art = Arc::new(Mutex::new(OxidArt::new()));
+
+        // Spawn the ticker (updates every 100ms)
+        let _handle = spawn_ticker(art.clone(), Duration::from_millis(100));
+
+        // Initial tick to set current time
+        art.lock().await.tick();
+
+        // batch:1 expires in 1 second
+        art.lock().await.set_ttl(
+            Bytes::from_static(b"batch:1"),
+            Duration::from_secs(1),
+            Bytes::from_static(b"expires_soon"),
+        );
+
+        // batch:2 never expires
+        art.lock().await.set(
+            Bytes::from_static(b"batch:2"),
+            Bytes::from_static(b"forever"),
+        );
+
+        // Both should exist initially
+        let results = art.lock().await.getn(Bytes::from_static(b"batch:"));
+        assert_eq!(results.len(), 2, "should have 2 entries before expiration");
+
+        // Wait 2 seconds for batch:1 to expire
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Yield to let the ticker task run and update the timestamp
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Only batch:2 should remain
+        let results = art.lock().await.getn(Bytes::from_static(b"batch:"));
+        assert_eq!(results.len(), 1, "should have 1 entry after expiration");
+        assert_eq!(
+            results[0],
+            (
+                Bytes::from_static(b"batch:2"),
+                Bytes::from_static(b"forever")
+            )
+        );
+    }
+}

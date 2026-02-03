@@ -22,7 +22,7 @@ fn test_empty_key() {
 
 #[test]
 fn test_get_nonexistent() {
-    let art = OxidArt::new();
+    let mut art = OxidArt::new();
     assert_eq!(art.get(Bytes::from_static(b"missing")), None);
 }
 
@@ -619,6 +619,102 @@ fn test_deln_partial_match() {
     assert_eq!(
         art.get(Bytes::from_static(b"world")),
         Some(Bytes::from_static(b"3"))
+    );
+}
+
+// ============ Tests TTL ============
+
+#[cfg(feature = "ttl")]
+#[test]
+fn test_ttl_expired_on_get() {
+    use std::time::Duration;
+
+    let mut art = OxidArt::new();
+    art.set_now(0);
+
+    // Insert with short TTL (1 second)
+    art.set_ttl(Bytes::from_static(b"expired"), Duration::from_secs(1), Bytes::from_static(b"old"));
+    // Insert with longer TTL (100 seconds)
+    art.set_ttl(Bytes::from_static(b"valid"), Duration::from_secs(100), Bytes::from_static(b"new"));
+    // Insert with no expiry
+    art.set(Bytes::from_static(b"forever"), Bytes::from_static(b"eternal"));
+
+    // Move time forward past first TTL
+    art.set_now(50);
+
+    // Expired key should return None and be cleaned up
+    assert_eq!(art.get(Bytes::from_static(b"expired")), None);
+    // Valid key should still work
+    assert_eq!(
+        art.get(Bytes::from_static(b"valid")),
+        Some(Bytes::from_static(b"new"))
+    );
+    // No expiry key should work
+    assert_eq!(
+        art.get(Bytes::from_static(b"forever")),
+        Some(Bytes::from_static(b"eternal"))
+    );
+
+    // Move time forward, valid should expire
+    art.set_now(150);
+    assert_eq!(art.get(Bytes::from_static(b"valid")), None);
+    // No expiry still works
+    assert_eq!(
+        art.get(Bytes::from_static(b"forever")),
+        Some(Bytes::from_static(b"eternal"))
+    );
+}
+
+#[cfg(feature = "ttl")]
+#[test]
+fn test_ttl_getn_filters_expired() {
+    use std::time::Duration;
+
+    let mut art = OxidArt::new();
+    art.set_now(0);
+
+    // Short TTL - will expire
+    art.set_ttl(Bytes::from_static(b"user:expired"), Duration::from_secs(1), Bytes::from_static(b"old"));
+    // Longer TTL - won't expire
+    art.set_ttl(Bytes::from_static(b"user:valid"), Duration::from_secs(100), Bytes::from_static(b"new"));
+    // No expiry
+    art.set(Bytes::from_static(b"user:forever"), Bytes::from_static(b"eternal"));
+
+    // Move time forward past first TTL
+    art.set_now(50);
+
+    let results = art.getn(Bytes::from_static(b"user:"));
+
+    // Should only return 2 (valid and forever), not the expired one
+    assert_eq!(results.len(), 2);
+    assert!(!results.iter().any(|(k, _)| k == &Bytes::from_static(b"user:expired")));
+    assert!(results.iter().any(|(k, _)| k == &Bytes::from_static(b"user:valid")));
+    assert!(results.iter().any(|(k, _)| k == &Bytes::from_static(b"user:forever")));
+}
+
+#[cfg(feature = "ttl")]
+#[test]
+fn test_ttl_cleanup_on_expired_get() {
+    use std::time::Duration;
+
+    let mut art = OxidArt::new();
+    art.set_now(0);
+
+    // Create a path: user -> er (with short TTL)
+    art.set_ttl(Bytes::from_static(b"user"), Duration::from_secs(1), Bytes::from_static(b"expired_user"));
+    // Longer TTL
+    art.set_ttl(Bytes::from_static(b"username"), Duration::from_secs(100), Bytes::from_static(b"valid"));
+
+    // Move time forward
+    art.set_now(50);
+
+    // Get the expired key - should trigger cleanup
+    assert_eq!(art.get(Bytes::from_static(b"user")), None);
+
+    // The valid key should still work
+    assert_eq!(
+        art.get(Bytes::from_static(b"username")),
+        Some(Bytes::from_static(b"valid"))
     );
 }
 
