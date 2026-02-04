@@ -71,7 +71,9 @@ dependencies = [
 
 [[package]]
 name = "hislab"
-version = "0.1.1"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1836cda86e110122414de1e782dc30091c8c3ceed97b50d25697102849401479"
 dependencies = [
  "rand",
 ]
@@ -171,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "oxidart"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrayvec",
  "bytes",

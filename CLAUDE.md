@@ -55,6 +55,7 @@ OxidArt is an Adaptive Radix Tree (ART) implementation optimized for O(k) key-va
 **Async modules (monoio.rs, tokio.rs)**:
 - `tick()`: Updates internal timestamp to current system time
 - `spawn_ticker()`: Spawns background task for periodic timestamp updates
+- `spawn_evictor()`: Spawns background task for periodic TTL eviction
 
 ### Key Algorithms
 
@@ -69,18 +70,46 @@ OxidArt is an Adaptive Radix Tree (ART) implementation optimized for O(k) key-va
 | Method | Description |
 |--------|-------------|
 | `new()` | Create empty tree |
-| `shared_with_ticker(interval)` | Create shared tree with auto-ticker (recommended for TTL) |
+| `shared_with_ticker(interval)` | Create shared tree with auto-ticker |
+| `shared_with_evictor(tick_interval, evict_interval)` | Create shared tree with ticker + evictor (recommended) |
 | `get(key)` | Exact key lookup |
 | `set(key, val)` | Insert/update without expiration |
-| `set_ttl(key, duration, val)` | Insert/update with TTL (requires `ttl` feature) |
+| `set_ttl(key, duration, val)` | Insert/update with TTL |
 | `del(key)` | Delete exact key, returns old value |
 | `getn(prefix)` | Get all key-value pairs matching prefix |
 | `deln(prefix)` | Delete all entries matching prefix, returns count |
-| `set_now(timestamp)` | Update internal clock (requires `ttl` feature) |
-| `tick()` | Update clock to current time (requires `monoio` or `tokio`) |
-| `evict_expired()` | Redis-style TTL eviction: sample 20, evict expired, loop if >=25% evicted (requires `ttl` feature) |
+| `get_ttl(key)` | Get TTL status of a key (returns `TtlResult`) |
+| `expire(key, duration)` | Set TTL on existing key |
+| `persist(key)` | Remove TTL from key (make permanent) |
+| `set_now(timestamp)` | Update internal clock |
+| `tick()` | Update clock to current time |
+| `evict_expired()` | Redis-style TTL eviction |
 
-**Note:** For TTL usage, prefer `shared_with_ticker()` over `new()` as it handles timestamp updates automatically.
+### TtlResult Enum
+
+```rust
+pub enum TtlResult {
+    KeyNotExist,        // Key doesn't exist or is expired
+    KeyWithTtl(u64),    // Key exists with remaining seconds
+    KeyWithoutTtl,      // Key exists, no TTL (permanent)
+}
+```
+
+### Recommended Usage (Production)
+
+```rust
+// monoio
+let tree = OxidArt::shared_with_evictor(
+    Duration::from_millis(100),  // tick interval
+    Duration::from_secs(1),       // eviction interval
+);
+
+// tokio
+let tree = OxidArt::shared_with_evictor(
+    Duration::from_millis(100),
+    Duration::from_secs(1),
+).await;
+```
 
 ### TTL Eviction Strategy
 
