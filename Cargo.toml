@@ -14,13 +14,19 @@ categories = ["data-structures", "algorithms"]
 [dependencies]
 arrayvec = "0.7.6"
 bytes = "1.11.0"
-slab = "0.4.11"
 smallvec = "1.15.1"
 monoio = { version = "0.2", optional = true }
-tokio = { version = "1", features = ["time", "sync", "rt", "macros"], optional = true }
+tokio = { version = "1", features = [
+    "time",
+    "sync",
+    "rt",
+    "macros",
+], optional = true }
+hislab = { path = "../hislab" }
+rand = { version = "0.8", optional = true }
 
 [features]
 default = ["ttl"]
-ttl = []
+ttl = ["hislab/tagged", "hislab/rand", "dep:rand"]
 monoio = ["dep:monoio", "ttl"]
 tokio = ["dep:tokio", "ttl"]

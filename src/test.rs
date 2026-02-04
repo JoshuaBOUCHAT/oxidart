@@ -718,4 +718,89 @@ fn test_ttl_cleanup_on_expired_get() {
     );
 }
 
+#[cfg(feature = "ttl")]
+#[test]
+fn test_evict_expired_basic() {
+    use std::time::Duration;
+
+    let mut art = OxidArt::new();
+    art.set_now(0);
+
+    // Insert 50 keys with short TTL
+    for i in 0..50u8 {
+        let key = Bytes::from(vec![b'k', i]);
+        art.set_ttl(key, Duration::from_secs(1), Bytes::from_static(b"val"));
+    }
+
+    // Insert 10 keys with long TTL
+    for i in 0..10u8 {
+        let key = Bytes::from(vec![b'l', i]);
+        art.set_ttl(key, Duration::from_secs(1000), Bytes::from_static(b"val"));
+    }
+
+    // Insert 10 keys without TTL
+    for i in 0..10u8 {
+        let key = Bytes::from(vec![b'n', i]);
+        art.set(key, Bytes::from_static(b"val"));
+    }
+
+    // Move time forward - short TTL keys are now expired
+    art.set_now(100);
+
+    // Evict expired entries (may need multiple calls due to probabilistic sampling)
+    let mut total_evicted = 0;
+    for _ in 0..10 {
+        let evicted = art.evict_expired();
+        total_evicted += evicted;
+        if evicted == 0 {
+            break;
+        }
+    }
+
+    // Should have evicted all 50 expired keys
+    assert_eq!(total_evicted, 50);
+
+    // Long TTL keys should still exist
+    for i in 0..10u8 {
+        let key = Bytes::from(vec![b'l', i]);
+        assert_eq!(art.get(key), Some(Bytes::from_static(b"val")));
+    }
+
+    // No TTL keys should still exist
+    for i in 0..10u8 {
+        let key = Bytes::from(vec![b'n', i]);
+        assert_eq!(art.get(key), Some(Bytes::from_static(b"val")));
+    }
+}
+
+#[cfg(feature = "ttl")]
+#[test]
+fn test_evict_expired_partial() {
+    use std::time::Duration;
+
+    let mut art = OxidArt::new();
+    art.set_now(0);
+
+    // Insert 10 keys with short TTL (will expire)
+    for i in 0..10u8 {
+        let key = Bytes::from(vec![b'e', i]);
+        art.set_ttl(key, Duration::from_secs(1), Bytes::from_static(b"val"));
+    }
+
+    // Insert 90 keys with long TTL (won't expire)
+    for i in 0..90u8 {
+        let key = Bytes::from(vec![b'v', i]);
+        art.set_ttl(key, Duration::from_secs(1000), Bytes::from_static(b"val"));
+    }
+
+    // Move time forward
+    art.set_now(100);
+
+    // Evict - should stop after one round since < 25% expired
+    let evicted = art.evict_expired();
+
+    // Should have evicted at most the 10 expired keys
+    assert!(evicted <= 10);
+}
+
 // ============ Tests avec dictionnaire français ============

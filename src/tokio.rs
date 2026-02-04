@@ -65,6 +65,49 @@ impl OxidArt {
         art
     }
 
+    /// Creates a new shared OxidArt with automatic background ticker and evictor.
+    ///
+    /// This is the recommended constructor for production use with TTL features.
+    /// It returns an `Arc<Mutex<OxidArt>>` and spawns two background tasks:
+    /// - A ticker that periodically updates the internal timestamp
+    /// - An evictor that removes expired entries using Redis-style sampling
+    ///
+    /// # Arguments
+    ///
+    /// * `tick_interval` - How often to update the timestamp (e.g., 100ms)
+    /// * `evict_interval` - How often to run eviction (e.g., 1s)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use oxidart::OxidArt;
+    /// use std::time::Duration;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let tree = OxidArt::shared_with_evictor(
+    ///         Duration::from_millis(100),
+    ///         Duration::from_secs(1),
+    ///     ).await;
+    ///
+    ///     tree.lock().await.set_ttl(
+    ///         Bytes::from_static(b"key"),
+    ///         Duration::from_secs(60),
+    ///         Bytes::from_static(b"value"),
+    ///     );
+    /// }
+    /// ```
+    pub async fn shared_with_evictor(
+        tick_interval: Duration,
+        evict_interval: Duration,
+    ) -> SharedArt {
+        let art = Arc::new(Mutex::new(Self::new()));
+        art.lock().await.tick(); // Initial tick
+        spawn_ticker(art.clone(), tick_interval);
+        spawn_evictor(art.clone(), evict_interval);
+        art
+    }
+
     /// Updates the internal timestamp to the current system time.
     ///
     /// This is a convenience method for async runtimes.
@@ -121,6 +164,50 @@ pub fn spawn_ticker(
         loop {
             interval_timer.tick().await;
             art.lock().await.tick();
+        }
+    })
+}
+
+/// Spawns a background task that periodically evicts expired entries.
+///
+/// This implements Redis-style probabilistic eviction: samples random entries
+/// with TTL and removes expired ones. If many are expired, it continues sampling.
+///
+/// # Arguments
+///
+/// * `art` - A shared reference to the tree (`Arc<Mutex<OxidArt>>`)
+/// * `interval` - How often to run eviction (e.g., 1s)
+///
+/// # Returns
+///
+/// A `JoinHandle` that can be used to abort the evictor if needed.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use oxidart::OxidArt;
+/// use std::sync::Arc;
+/// use tokio::sync::Mutex;
+/// use std::time::Duration;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let shared_art = Arc::new(Mutex::new(OxidArt::new()));
+///
+///     // Spawn ticker and evictor
+///     oxidart::tokio::spawn_ticker(shared_art.clone(), Duration::from_millis(100));
+///     oxidart::tokio::spawn_evictor(shared_art.clone(), Duration::from_secs(1));
+/// }
+/// ```
+pub fn spawn_evictor(
+    art: Arc<Mutex<OxidArt>>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval_timer = tokio::time::interval(interval);
+        loop {
+            interval_timer.tick().await;
+            art.lock().await.evict_expired();
         }
     })
 }

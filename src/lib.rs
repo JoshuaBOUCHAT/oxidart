@@ -59,7 +59,7 @@ pub mod tokio;
 mod test;
 
 use bytes::Bytes;
-use slab::Slab;
+use hislab::HiSlab;
 use smallvec::SmallVec;
 
 use crate::node_childs::ChildAble;
@@ -69,6 +69,18 @@ use crate::node_childs::HugeChilds;
 /// Internal sentinel value indicating no expiration (never expires)
 #[cfg(feature = "ttl")]
 const NO_EXPIRY: u64 = u64::MAX;
+
+/// Result of a TTL lookup operation.
+#[cfg(feature = "ttl")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtlResult {
+    /// The key does not exist.
+    KeyNotExist,
+    /// The key exists and has a TTL (remaining seconds until expiration).
+    KeyWithTtl(u64),
+    /// The key exists but has no TTL (permanent).
+    KeyWithoutTtl,
+}
 
 /// A compressed Adaptive Radix Tree for fast key-value storage.
 ///
@@ -88,10 +100,8 @@ const NO_EXPIRY: u64 = u64::MAX;
 /// ```
 ///
 pub struct OxidArt {
-    pub(crate) map: Slab<Node>,
-    pub(crate) child_list: Slab<HugeChilds>,
-    #[cfg(feature = "ttl")]
-    versions: Vec<u32>,
+    pub(crate) map: HiSlab<Node>,
+    pub(crate) child_list: HiSlab<HugeChilds>,
     /// Current timestamp (seconds since UNIX epoch).
     /// The server is responsible for updating this via `set_now()`.
     #[cfg(feature = "ttl")]
@@ -117,20 +127,14 @@ impl OxidArt {
     /// let tree = OxidArt::new();
     /// ```
     pub fn new() -> Self {
-        let mut map = Slab::with_capacity(1024);
-        let root_idx = map.insert(Node::default()) as u32;
-        let child_list = Slab::with_capacity(32);
-
-        // On ne crée le vecteur que si la feature est là
-        #[cfg(feature = "ttl")]
-        let versions = vec![0]; // Initialise avec 0 pour le root par exemple
+        let mut map = HiSlab::new();
+        let root_idx = map.insert(Node::default());
+        let child_list = HiSlab::new();
 
         Self {
             map,
             root_idx,
             child_list,
-            #[cfg(feature = "ttl")]
-            versions,
             #[cfg(feature = "ttl")]
             now: 0,
         }
@@ -142,20 +146,98 @@ impl OxidArt {
     pub fn set_now(&mut self, now: u64) {
         self.now = now;
     }
-    fn insert(&mut self, node: Node) -> u32 {
-        let idx = self.map.insert(node) as u32;
 
-        // Ce bloc disparaît complètement de la compilation si "ttl" n'est pas actif
-        #[cfg(feature = "ttl")]
-        {
-            if self.versions.len() == idx as usize {
-                self.versions.push(0);
-            } else {
-                self.versions[idx as usize] += 1;
+    /// Evicts expired entries using Redis-style probabilistic sampling.
+    ///
+    /// Algorithm:
+    /// 1. Sample up to 20 random entries with TTL
+    /// 2. Delete those that are expired
+    /// 3. If >= 25% (5+) were expired, repeat
+    /// 4. Stop when < 25% expired or no more entries
+    ///
+    /// Returns the total number of evicted entries.
+    #[cfg(feature = "ttl")]
+    pub fn evict_expired(&mut self) -> usize {
+        const SAMPLE_SIZE: usize = 20;
+        const THRESHOLD: usize = 5; // 25% of 20
+
+        let mut rng = rand::thread_rng();
+        let mut total_evicted = 0;
+
+        loop {
+            let mut evicted_this_round = 0;
+            let mut sampled = 0;
+
+            // Sample up to SAMPLE_SIZE tagged nodes
+            for _ in 0..SAMPLE_SIZE {
+                let Some((idx, node)) = self.map.random_tagged(&mut rng) else {
+                    // No more tagged entries
+                    break;
+                };
+                sampled += 1;
+
+                // Check if expired
+                if node.is_expired(self.now) {
+                    let parent_idx = node.parent_idx;
+                    let parent_radix = node.parent_radix;
+
+                    // Don't try to delete root
+                    if parent_idx != u32::MAX {
+                        self.delete_node_for_eviction(idx, parent_idx, parent_radix);
+                        evicted_this_round += 1;
+                    }
+                }
+            }
+
+            total_evicted += evicted_this_round;
+
+            // Stop if we sampled less than SAMPLE_SIZE (not enough entries)
+            // or if less than 25% were expired
+            if sampled < SAMPLE_SIZE || evicted_this_round < THRESHOLD {
+                break;
             }
         }
 
-        idx
+        total_evicted
+    }
+
+    /// Delete a node during TTL eviction (similar to delete_node_inline but uses stored parent info)
+    #[cfg(feature = "ttl")]
+    fn delete_node_for_eviction(&mut self, target_idx: u32, parent_idx: u32, parent_radix: u8) {
+        let has_children = {
+            let Some(node) = self.try_get_node(target_idx) else {
+                return;
+            };
+            !node.childs.is_empty() || node.childs.get_next_idx().is_some()
+        };
+
+        if has_children {
+            // Node has children: just clear the value, keep the node
+            self.get_node_mut(target_idx).val = None;
+            // Untag since it no longer has a TTL value
+            self.map.untag(target_idx);
+            self.try_recompress(target_idx);
+        } else {
+            // Leaf node: remove completely
+            self.map.remove(target_idx);
+            self.remove_child(parent_idx, parent_radix);
+            if parent_idx != self.root_idx {
+                self.try_recompress(parent_idx);
+            }
+        }
+    }
+
+    /// Insert a node without TTL tag
+    #[inline]
+    fn insert(&mut self, node: Node) -> u32 {
+        self.map.insert(node)
+    }
+
+    /// Insert a node with TTL tag (for random sampling during expiration)
+    #[cfg(feature = "ttl")]
+    #[inline]
+    fn insert_tagged(&mut self, node: Node) -> u32 {
+        self.map.insert_tagged(node)
     }
     fn get_node(&self, idx: u32) -> &Node {
         self.try_get_node(idx)
@@ -167,10 +249,10 @@ impl OxidArt {
     }
 
     fn try_get_node(&self, idx: u32) -> Option<&Node> {
-        self.map.get(idx as usize)
+        self.map.get(idx)
     }
     fn try_get_node_mut(&mut self, idx: u32) -> Option<&mut Node> {
-        self.map.get_mut(idx as usize)
+        self.map.get_mut(idx)
     }
     fn find(&self, idx: u32, radix: u8) -> Option<u32> {
         let child = &self.try_get_node(idx)?.childs;
@@ -179,11 +261,11 @@ impl OxidArt {
             return Some(index);
         }
         self.child_list
-            .get(child.get_next_idx()? as usize)?
+            .get(child.get_next_idx()?)?
             .find(radix)
     }
     fn intiate_new_huge_child(&mut self, radix: u8, idx: u32) -> u32 {
-        self.child_list.insert(HugeChilds::new(radix, idx)) as u32
+        self.child_list.insert(HugeChilds::new(radix, idx))
     }
 }
 impl OxidArt {
@@ -247,6 +329,113 @@ impl OxidArt {
         }
     }
 
+    /// Returns the TTL status of a key.
+    ///
+    /// # Returns
+    ///
+    /// - `TtlResult::KeyNotExist` - The key does not exist or is expired
+    /// - `TtlResult::KeyWithTtl(remaining)` - The key exists with remaining seconds until expiration
+    /// - `TtlResult::KeyWithoutTtl` - The key exists but has no TTL (permanent)
+    #[cfg(feature = "ttl")]
+    pub fn get_ttl(&self, key: Bytes) -> TtlResult {
+        debug_assert!(key.is_ascii(), "key must be ASCII");
+
+        let idx = match self.traverse_to_key(&key) {
+            Some(idx) => idx,
+            None => return TtlResult::KeyNotExist,
+        };
+
+        let node = self.get_node(idx);
+        match &node.val {
+            None => TtlResult::KeyNotExist,
+            Some((_, expiry)) if *expiry == NO_EXPIRY => TtlResult::KeyWithoutTtl,
+            Some((_, expiry)) if *expiry <= self.now => TtlResult::KeyNotExist,
+            Some((_, expiry)) => TtlResult::KeyWithTtl(expiry - self.now),
+        }
+    }
+
+    /// Sets a TTL on an existing key.
+    ///
+    /// Returns `true` if the key exists and the TTL was set, `false` otherwise.
+    #[cfg(feature = "ttl")]
+    pub fn expire(&mut self, key: Bytes, ttl: std::time::Duration) -> bool {
+        debug_assert!(key.is_ascii(), "key must be ASCII");
+
+        let Some(idx) = self.traverse_to_key(&key) else {
+            return false;
+        };
+
+        let now = self.now;
+        let new_expiry = now.saturating_add(ttl.as_secs());
+
+        let node = self.get_node_mut(idx);
+        match &mut node.val {
+            None => false,
+            Some((_, expiry)) if *expiry != NO_EXPIRY && *expiry <= now => false,
+            Some((_, expiry)) => {
+                let was_permanent = *expiry == NO_EXPIRY;
+                *expiry = new_expiry;
+                // Tag the node if it wasn't already (was permanent)
+                if was_permanent {
+                    self.map.tag(idx);
+                }
+                true
+            }
+        }
+    }
+
+    /// Removes the TTL from a key, making it permanent.
+    ///
+    /// Returns `true` if the key exists and had a TTL, `false` otherwise.
+    #[cfg(feature = "ttl")]
+    pub fn persist(&mut self, key: Bytes) -> bool {
+        debug_assert!(key.is_ascii(), "key must be ASCII");
+
+        let Some(idx) = self.traverse_to_key(&key) else {
+            return false;
+        };
+
+        let now = self.now;
+
+        let node = self.get_node_mut(idx);
+        match &mut node.val {
+            None => false,
+            Some((_, expiry)) if *expiry == NO_EXPIRY => false, // Already permanent
+            Some((_, expiry)) if *expiry <= now => false,       // Expired
+            Some((_, expiry)) => {
+                *expiry = NO_EXPIRY;
+                // Untag the node since it no longer has TTL
+                self.map.untag(idx);
+                true
+            }
+        }
+    }
+
+    /// Traverses to a key and returns the node index if found.
+    #[cfg(feature = "ttl")]
+    fn traverse_to_key(&self, key: &[u8]) -> Option<u32> {
+        let key_len = key.len();
+        if key_len == 0 {
+            return Some(self.root_idx);
+        }
+
+        let mut idx = self.find(self.root_idx, key[0])?;
+        let mut cursor = 1;
+
+        loop {
+            let node = self.try_get_node(idx)?;
+            match node.compare_compression_key(&key[cursor..]) {
+                CompResult::Final => return Some(idx),
+                CompResult::Partial(_) => return None,
+                CompResult::Path => {
+                    cursor += node.compression.len();
+                }
+            }
+            idx = self.find(idx, key[cursor])?;
+            cursor += 1;
+        }
+    }
+
     /// Deletes a node inline (used for TTL expiration cleanup)
     #[cfg(feature = "ttl")]
     fn delete_node_inline(&mut self, target_idx: u32, parent_idx: u32, parent_radix: u8) {
@@ -259,7 +448,7 @@ impl OxidArt {
             self.get_node_mut(target_idx).val = None;
             self.try_recompress(target_idx);
         } else {
-            self.map.remove(target_idx as usize);
+            self.map.remove(target_idx );
             self.remove_child(parent_idx, parent_radix);
             if parent_idx != self.root_idx {
                 self.try_recompress(parent_idx);
@@ -415,7 +604,7 @@ impl OxidArt {
         }
 
         if let Some(huge_idx) = node.childs.get_next_idx()
-            && let Some(huge_childs) = self.child_list.get(huge_idx as usize)
+            && let Some(huge_childs) = self.child_list.get(huge_idx )
         {
             for (radix, child_idx) in huge_childs.iter() {
                 f(radix, child_idx);
@@ -539,12 +728,23 @@ impl OxidArt {
 
             // Create a node for the old content
             let old_radix = old_compression[common_len];
+            // Check if old value had a TTL (needs to stay tagged)
+            let old_had_ttl = old_val
+                .as_ref()
+                .map(|(_, old_ttl)| *old_ttl != NO_EXPIRY)
+                .unwrap_or(false);
             let old_child = Node {
                 compression: SmallVec::from_slice(&old_compression[common_len + 1..]),
                 val: old_val,
                 childs: old_childs,
+                parent_idx: idx,
+                parent_radix: old_radix,
             };
-            let old_child_idx = self.insert(old_child);
+            let old_child_idx = if old_had_ttl {
+                self.insert_tagged(old_child)
+            } else {
+                self.insert(old_child)
+            };
             self.get_node_mut(idx).childs.push(old_radix, old_child_idx);
 
             // If the value doesn't go on the intermediate node, create a new leaf
@@ -632,30 +832,35 @@ impl OxidArt {
     #[cfg(feature = "ttl")]
     fn create_node_with_val(
         &mut self,
-        idx: u32,
+        parent_idx: u32,
         radix: u8,
         val: Bytes,
         compression: &[u8],
         ttl: u64,
     ) {
         let (is_full, huge_child_idx) = {
-            let father_node = self.get_node(idx);
+            let father_node = self.get_node(parent_idx);
             (
                 father_node.childs.is_full(),
                 father_node.get_huge_childs_idx(),
             )
         };
-        let new_leaf = Node::new_leaf(compression, val, ttl);
-        let inserted_idx = self.insert(new_leaf);
+        let new_leaf = Node::new_leaf(compression, val, ttl, parent_idx, radix);
+        // Tag the node if it has a real TTL (not NO_EXPIRY)
+        let inserted_idx = if ttl != NO_EXPIRY {
+            self.insert_tagged(new_leaf)
+        } else {
+            self.insert(new_leaf)
+        };
         match (is_full, huge_child_idx) {
-            (false, _) => self.get_node_mut(idx).childs.push(radix, inserted_idx),
+            (false, _) => self.get_node_mut(parent_idx).childs.push(radix, inserted_idx),
             (true, None) => {
                 let new_child_idx = self.intiate_new_huge_child(radix, inserted_idx);
-                self.get_node_mut(idx).childs.set_new_childs(new_child_idx);
+                self.get_node_mut(parent_idx).childs.set_new_childs(new_child_idx);
             }
             (true, Some(huge_idx)) => {
                 self.child_list
-                    .get_mut(huge_idx as usize)
+                    .get_mut(huge_idx)
                     .expect("if key exist childs should too")
                     .push(radix, inserted_idx);
             }
@@ -681,7 +886,7 @@ impl OxidArt {
             }
             (true, Some(huge_idx)) => {
                 self.child_list
-                    .get_mut(huge_idx as usize)
+                    .get_mut(huge_idx )
                     .expect("if key exist childs should too")
                     .push(radix, inserted_idx);
             }
@@ -763,7 +968,7 @@ impl OxidArt {
             Some(old_val)
         } else {
             // Node without children (leaf): completely remove from the slab
-            let node = self.map.remove(target_idx as usize);
+            let node = self.map.remove(target_idx)?;
             let old_val = node.val?;
             self.remove_child(parent_idx, parent_radix);
             if parent_idx != self.root_idx {
@@ -885,7 +1090,7 @@ impl OxidArt {
         }
 
         if let Some(huge_idx) = node.childs.get_next_idx()
-            && let Some(huge_childs) = self.child_list.get(huge_idx as usize)
+            && let Some(huge_childs) = self.child_list.get(huge_idx )
         {
             for (_, child_idx) in huge_childs.iter() {
                 indices.push(child_idx);
@@ -911,7 +1116,7 @@ impl OxidArt {
 
                 let huge_idx = node.childs.get_next_idx();
                 if let Some(hi) = huge_idx
-                    && let Some(huge_childs) = self.child_list.get(hi as usize)
+                    && let Some(huge_childs) = self.child_list.get(hi )
                 {
                     children.extend(huge_childs.iter().map(|(_, idx)| idx));
                 }
@@ -929,17 +1134,61 @@ impl OxidArt {
 
             // Remove huge_childs if present
             if let Some(huge_idx) = huge_child_idx {
-                self.child_list.remove(huge_idx as usize);
+                self.child_list.remove(huge_idx );
             }
 
             // Remove the node from the slab
-            self.map.remove(node_idx as usize);
+            self.map.remove(node_idx );
         }
 
         count
     }
 
     /// If the node has exactly 1 child and no value, absorb the child
+    #[cfg(feature = "ttl")]
+    fn try_recompress(&mut self, node_idx: u32) {
+        let Some(node) = self.try_get_node(node_idx) else {
+            return;
+        };
+        if node.val.is_some() {
+            return;
+        }
+
+        let Some((child_radix, child_idx)) = node.childs.get_single_child() else {
+            return;
+        };
+
+        // Absorb the child: compression = current + radix + child.compression
+        let Some(child) = self.map.remove(child_idx) else {
+            return;
+        };
+
+        // Update parent_idx for all grandchildren (they now point to node_idx)
+        for (_, grandchild_idx) in child.childs.iter() {
+            if let Some(grandchild) = self.map.get_mut(grandchild_idx) {
+                grandchild.parent_idx = node_idx;
+            }
+        }
+        if let Some(huge_idx) = child.childs.get_next_idx() {
+            if let Some(huge_childs) = self.child_list.get(huge_idx) {
+                let indices: Vec<u32> = huge_childs.iter().map(|(_, idx)| idx).collect();
+                for grandchild_idx in indices {
+                    if let Some(grandchild) = self.map.get_mut(grandchild_idx) {
+                        grandchild.parent_idx = node_idx;
+                    }
+                }
+            }
+        }
+
+        let node = self.get_node_mut(node_idx);
+        node.compression.push(child_radix);
+        node.compression.extend_from_slice(&child.compression);
+        node.val = child.val;
+        node.childs = child.childs;
+    }
+
+    /// If the node has exactly 1 child and no value, absorb the child
+    #[cfg(not(feature = "ttl"))]
     fn try_recompress(&mut self, node_idx: u32) {
         let node = self.get_node(node_idx);
         if node.val.is_some() {
@@ -951,7 +1200,9 @@ impl OxidArt {
         };
 
         // Absorb the child: compression = current + radix + child.compression
-        let child = self.map.remove(child_idx as usize);
+        let Some(child) = self.map.remove(child_idx) else {
+            return;
+        };
         let node = self.get_node_mut(node_idx);
 
         node.compression.push(child_radix);
@@ -961,14 +1212,17 @@ impl OxidArt {
     }
 
     fn remove_child(&mut self, parent_idx: u32, radix: u8) {
-        let parent = self.get_node_mut(parent_idx);
+        let Some(parent) = self.try_get_node_mut(parent_idx) else {
+            // Parent was absorbed/removed during recompression, nothing to do
+            return;
+        };
         if parent.childs.remove(radix).is_some() {
             return;
         }
         // Otherwise it's in huge_childs
         if let Some(huge_idx) = parent.childs.get_next_idx() {
             self.child_list
-                .get_mut(huge_idx as usize)
+                .get_mut(huge_idx)
                 .expect("huge_childs should exist")
                 .remove(radix);
         }
@@ -976,11 +1230,27 @@ impl OxidArt {
 }
 
 #[cfg(feature = "ttl")]
-#[derive(Default)]
 struct Node {
     childs: Childs,
     compression: SmallVec<[u8; 8]>,
     val: Option<(Bytes, u64)>,
+    /// Parent node index (for TTL eviction)
+    parent_idx: u32,
+    /// Radix used to reach this node from parent (for TTL eviction)
+    parent_radix: u8,
+}
+
+#[cfg(feature = "ttl")]
+impl Default for Node {
+    fn default() -> Self {
+        Self {
+            childs: Childs::default(),
+            compression: SmallVec::new(),
+            val: None,
+            parent_idx: u32::MAX, // Root has no parent
+            parent_radix: 0,
+        }
+    }
 }
 
 #[cfg(not(feature = "ttl"))]
@@ -1071,11 +1341,13 @@ impl Node {
     }
 
     #[cfg(feature = "ttl")]
-    fn new_leaf(compression: &[u8], val: Bytes, ttl: u64) -> Self {
+    fn new_leaf(compression: &[u8], val: Bytes, ttl: u64, parent_idx: u32, parent_radix: u8) -> Self {
         Node {
             compression: SmallVec::from_slice(compression),
             val: Some((val, ttl)),
             childs: Childs::default(),
+            parent_idx,
+            parent_radix,
         }
     }
 
